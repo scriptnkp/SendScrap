@@ -1,8 +1,9 @@
-// ===== ตั้งค่า: ใส่ URL Web App ที่ได้จากการ Deploy Apps Script =====
+// ===== ตั้งค่า =====
 const API_URL = 'https://script.google.com/macros/s/AKfycbwuCFRaLfcmcPJT0_bttrBrZcGr8TARxirGPEXayLVywOuw0yHHNKIkLGhKDyMyxF-O/exec';
 const MAX_BYTES = 1000 * 1024;   // ≤ 1 MB
 const MAX_DIM   = 1920;
 const MAX_FILES = 10;
+const PARALLEL  = 3;             // อัปโหลดพร้อมกันครั้งละ 3 รูป
 
 const ITEMS = [
   ['1-50-001-0001','เศษสายอลูมิเนียมเปลือยชำรุด','กก.',79],
@@ -122,13 +123,39 @@ async function handleFiles(type, files) {
 }
 
 function renderPreview(type) {
-  const box = $(type + 'Preview');
-  box.innerHTML = photos[type].map((p, i) => `
+  $(type + 'Preview').innerHTML = photos[type].map((p, i) => `
     <div class="thumb">
       <img src="${p.data}" alt="">
       <span class="size">${(p.size / 1024).toFixed(0)} KB</span>
       <button type="button" data-type="${type}" data-i="${i}">×</button>
     </div>`).join('');
+}
+
+// ===== API =====
+async function api(body, retry = 1) {
+  try {
+    const res = await fetch(API_URL, { method: 'POST', body: JSON.stringify(body) }); // text/plain → ไม่ติด CORS
+    const out = await res.json();
+    if (!out.ok) throw new Error(out.error || 'Server error');
+    return out;
+  } catch (err) {
+    if (retry > 0) return api(body, retry - 1);
+    throw err;
+  }
+}
+
+// รันงานพร้อมกันแบบจำกัดจำนวน
+async function runPool(tasks, limit) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      const idx = next++;
+      results[idx] = await tasks[idx]();
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+  return results;
 }
 
 // ===== ส่งข้อมูล =====
@@ -149,21 +176,42 @@ async function submitForm(e) {
   e.preventDefault();
   if (!validate()) return;
   const it = getSelected();
-  const payload = {
-    code: it.code, name: it.name, unit: it.unit, price: it.price,
-    qty: $('qty').value, network: $('network').value.trim(), wbs: $('wbs').value.trim(),
-    supervisor: $('supervisor').value.trim(),
-    itemPhotos: photos.item.map(p => ({ data: p.data })),
-    slipPhotos: photos.slip.map(p => ({ data: p.data }))
-  };
+
+  const jobs = [
+    ...photos.item.map((p, i) => ({ type: 'item', data: p.data, index: i + 1 })),
+    ...photos.slip.map((p, i) => ({ type: 'slip', data: p.data, index: i + 1 }))
+  ];
+  const totalSteps = jobs.length + 1; // +1 = บันทึกลงชีต
+  let done = 0;
 
   $('submitBtn').disabled = true;
-  showOverlay('กำลังอัปโหลดและบันทึก...');
+  showOverlay(`กำลังอัปโหลดรูป 0/${jobs.length}`, true);
+  setProgress(0);
+
   try {
-    const res = await fetch(API_URL, { method: 'POST', body: JSON.stringify(payload) }); // text/plain → ไม่ติด CORS
-    const out = await res.json();
-    if (!out.ok) throw new Error(out.error);
-    localStorage.setItem('supervisor', payload.supervisor);
+    const ids = await runPool(jobs.map(job => async () => {
+      const out = await api({ action: 'upload', code: it.code, ...job });
+      done++;
+      setProgress(done / totalSteps * 100);
+      $('overlayText').textContent = `กำลังอัปโหลดรูป ${done}/${jobs.length}`;
+      return { type: job.type, id: out.id };
+    }), PARALLEL);
+
+    $('overlayText').textContent = 'กำลังบันทึกข้อมูลลงชีต...';
+    await api({
+      action: 'save',
+      code: it.code, name: it.name, unit: it.unit, price: it.price,
+      qty: $('qty').value, network: $('network').value.trim(), wbs: $('wbs').value.trim(),
+      supervisor: $('supervisor').value.trim(),
+      itemIds: ids.filter(x => x.type === 'item').map(x => x.id),
+      slipIds: ids.filter(x => x.type === 'slip').map(x => x.id)
+    });
+
+    setProgress(100);
+    $('overlayText').textContent = 'บันทึกสำเร็จ ✅';
+    await new Promise(r => setTimeout(r, 600));
+
+    localStorage.setItem('supervisor', $('supervisor').value.trim());
     toast('✅ บันทึกข้อมูลสำเร็จ', 'ok');
     resetForm();
   } catch (err) {
@@ -183,8 +231,18 @@ function resetForm() {
 }
 
 // ===== UI helpers =====
-function showOverlay(t) { $('overlayText').textContent = t; $('overlay').classList.remove('hidden'); }
+function showOverlay(text, withProgress = false) {
+  $('overlayText').textContent = text;
+  $('progressWrap').classList.toggle('hidden', !withProgress);
+  $('progressPct').classList.toggle('hidden', !withProgress);
+  $('overlay').classList.remove('hidden');
+}
 function hideOverlay() { $('overlay').classList.add('hidden'); }
+function setProgress(pct) {
+  const v = Math.max(0, Math.min(100, Math.round(pct)));
+  $('progressBar').style.width = v + '%';
+  $('progressPct').textContent = v + '%';
+}
 let tTimer;
 function toast(msg, type = '') {
   const t = $('toast');
